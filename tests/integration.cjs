@@ -109,7 +109,7 @@ function setup(options={}){
   const document=new Document(html),calls=[],stored=new Map();let parallel=0,maxParallel=0,geminiCount=0;
   if(options.stored)stored.set('nexus.ai.config.v1',JSON.stringify(options.stored));
   const localStorage={getItem:key=>{if(options.storageUnavailable)throw Error('storage unavailable');return stored.get(key)||null;},setItem:(key,v)=>{if(options.storageUnavailable)throw Error('storage unavailable');stored.set(key,v);},removeItem:key=>stored.delete(key)};
-  const window=new Element('window',document);window.innerWidth=options.mobile?375:1440;window.matchMedia=()=>({matches:!!options.mobile,addEventListener(){}});
+  const window=new Element('window',document);window.innerWidth=options.mobile?375:1440;window.matchMedia=query=>({matches:query.includes('prefers-reduced-motion')?!!options.reducedMotion:!!options.mobile,addEventListener(){}});
   const timers=new Set();
   const context={document,window,localStorage,sessionStorage:localStorage,navigator:{clipboard:{writeText:async()=>{}}},console,URL,AbortController,DOMException,Blob,TextEncoder,TextDecoder,Event:class{constructor(type,opts={}){this.type=type;Object.assign(this,opts);}},matchMedia:window.matchMedia,performance:{now:()=>Date.now()},requestAnimationFrame:fn=>setTimeout(fn,0),cancelAnimationFrame:clearTimeout,getComputedStyle:()=>({}),setTimeout,clearTimeout,setInterval:(fn,ms)=>{const t=setInterval(fn,ms);timers.add(t);return t;},clearInterval:t=>{clearInterval(t);timers.delete(t);}};
   context.fetch=async(url,request)=>{
@@ -247,6 +247,8 @@ async function main(){
   const s=setup();try{
    s.eval("switchTab('records')");assert.equal(s.get('paneRecords').hidden,false);assert.equal(s.get('paneResult').hidden,true);assert.equal(s.get('tabRecords').getAttribute('aria-selected'),'true');assert.equal(s.get('tabRecords').tabIndex,0);assert.equal(s.get('tabResult').tabIndex,-1);
    s.get('tabRecords').dispatchEvent({type:'keydown',key:'Home'});assert.equal(s.get('paneResult').hidden,false);assert.equal(s.document.activeElement,s.get('tabResult'));
+   s.get('tabResult').dispatchEvent({type:'keydown',key:'End'});assert.equal(s.get('paneLive').hidden,false);assert.equal(s.get('paneResult').hidden,true);assert.equal(s.get('paneRecords').hidden,true);assert.equal(s.get('tabLive').getAttribute('aria-selected'),'true');assert.equal(s.document.activeElement,s.get('tabLive'));
+   s.get('tabLive').dispatchEvent({type:'keydown',key:'ArrowRight'});assert.equal(s.get('paneResult').hidden,false);assert.equal(s.document.activeElement,s.get('tabResult'));
   }finally{s.dispose();}
  });
  await caseTest('reset clears workspace but preserves credentials and in-session history',async()=>{
@@ -268,10 +270,65 @@ async function main(){
    const button=s.document.querySelector('[data-template="code"]');assert(button);button.click();assert.match(s.get('task').value,/知识库/);assert.match(s.get('taskCount').textContent,/字/);assert.equal(s.calls.length,0);
   }finally{s.dispose();}
  });
+ await caseTest('meeting a companion changes identity and guidance without calling APIs',async()=>{
+  const s=setup();try{
+   assert.equal(s.eval('selectedPersona'),'gemini');assert.equal(s.eval('teamEvents.length'),0);
+   s.get('grokPersona').click();assert.equal(s.eval('selectedPersona'),'grok');assert.equal(s.get('grokPersona').getAttribute('aria-pressed'),'true');assert.equal(s.get('geminiPersona').getAttribute('aria-pressed'),'false');assert.equal(s.get('gptPersona').getAttribute('aria-pressed'),'false');assert.match(s.get('personaSpeaker').textContent,/逐风.*情报官/);assert.match(s.get('personaSpeech').textContent,/来源|信息边界/);
+   s.get('gptPersona').click();assert.match(s.get('personaSpeaker').textContent,/灵犀.*执行官/);assert.match(s.get('personaSpeech').textContent,/代码|文案/);
+   s.eval("selectPersona('unknown')");assert.equal(s.eval('selectedPersona'),'gpt');assert.equal(s.calls.length,0);assert.equal(s.eval('teamEvents.length'),0);assert(!/连接已验证/.test(s.get('globalStatus').textContent));
+   assert.match(s.get('paneLive').textContent,/流程旁白.*非模型原文/);
+  }finally{s.dispose();}
+ });
+ await caseTest('companions follow real dispatch and delivery instead of pretending to finish early',async()=>{
+  const s=setup();try{
+   const running=s.run();await until(()=>s.calls.length===3,'companion workers start');
+   assert.equal(s.get('geminiPersona').dataset.state,'idle');assert.equal(s.get('geminiPersonaStatus').textContent,'已分派');
+   for(const id of ['grok','gpt']){assert.equal(s.get(id+'Persona').dataset.state,'running');assert.equal(s.get(id+'PersonaStatus').textContent,'执行中');}
+   const during=JSON.parse(s.eval('JSON.stringify(teamEvents)'));assert(during.some(e=>e.id==='user'));assert(during.some(e=>e.id==='gemini'));assert(during.some(e=>e.id==='grok'&&e.state==='running'));assert(during.some(e=>e.id==='gpt'&&e.state==='running'));assert(!during.some(e=>e.state==='done'));
+   await running;
+   for(const id of ['gemini','grok','gpt'])assert.equal(s.get(id+'Persona').dataset.state,'done');
+   assert.equal(s.eval('selectedPersona'),'gemini');assert.match(s.get('personaSpeech').textContent,/最终成果准备好了/);assert.equal(s.get('teamFormation').dataset.phase,'4');
+   const events=JSON.parse(s.eval('JSON.stringify(teamEvents)'));assert(events.some(e=>e.id==='gemini'&&e.state==='done'));assert(events.every(e=>e.time!=='演示'));assert.equal(s.get('demoNotice').hidden,true);
+  }finally{s.dispose();}
+ });
+ await caseTest('a failed companion remains visibly failed while the successful work is delivered',async()=>{
+  const s=setup({failGrok:true});try{
+   await s.run();assert.equal(s.get('grokPersona').dataset.state,'error');assert.equal(s.get('grokPersonaStatus').textContent,'执行失败');assert.equal(s.get('gptPersona').dataset.state,'done');assert.equal(s.get('geminiPersona').dataset.state,'done');
+   s.get('grokPersona').click();assert.match(s.get('personaSpeech').textContent,/遇到了问题|具体原因/);
+   const events=JSON.parse(s.eval('JSON.stringify(teamEvents)'));assert(events.some(e=>e.id==='grok'&&e.state==='error'));assert(!events.some(e=>e.id==='grok'&&e.state==='done'));assert(!JSON.stringify(events).includes(KEYS.grok));assert.match(s.get('report').textContent,/最终成果/);
+  }finally{s.dispose();}
+ });
+ await caseTest('reset and history restore the matching companion state and collaboration narrative',async()=>{
+  const s=setup();try{
+   await s.run();const savedEvents=s.eval('JSON.stringify(teamEvents)');assert.equal(s.eval('JSON.stringify(sessionHistory[0].events)'),savedEvents);
+   s.eval('resetWorkspace()');assert.equal(s.eval('teamEvents.length'),0);assert.equal(s.eval('selectedPersona'),'gemini');assert.equal(s.get('teamFormation').dataset.phase,'0');assert.match(s.get('personaSpeech').textContent,/理清方向/);
+   for(const id of ['gemini','grok','gpt']){assert.equal(s.get(id+'Persona').dataset.state,'idle');assert.equal(s.get(id+'PersonaStatus').textContent,'等你开口');}
+   s.get('history').querySelector('button').click();assert.equal(s.eval('JSON.stringify(teamEvents)'),savedEvents);assert.equal(s.get('teamFormation').dataset.phase,'4');for(const id of ['gemini','grok','gpt'])assert.equal(s.get(id+'Persona').dataset.state,'done');assert.match(s.get('personaSpeech').textContent,/最终成果准备好了/);assert.equal(s.calls.length,4);
+  }finally{s.dispose();}
+ });
+ await caseTest('cancelled work stops companion activity and cannot narrate a successful delivery',async()=>{
+  const s=setup({ignoreAbort:true});try{
+   const running=s.run();await until(()=>s.calls.length===3,'workers begin before cancel');s.get('cancel').click();await running;
+   for(const id of ['gemini','grok','gpt'])assert.notEqual(s.get(id+'Persona').dataset.state,'running');
+   for(const id of ['grok','gpt']){assert.equal(s.get(id+'PersonaStatus').textContent,'已停止');s.get(id+'Persona').click();assert.match(s.get('personaSpeech').textContent,/先停下来/);}
+   const events=JSON.parse(s.eval('JSON.stringify(teamEvents)'));assert(!events.some(e=>e.id==='gemini'&&e.state==='done'));assert.equal(s.eval('finalText'),'');assert.equal(s.eval('sessionHistory.length'),0);s.eval('resetWorkspace()');assert.equal(s.eval('teamEvents.length'),0);assert.match(s.get('personaSpeech').textContent,/理清方向/);
+  }finally{s.dispose();}
+ });
+ await caseTest('companion motion respects reduced motion and the explicit off control',async()=>{
+  const reduced=setup({reducedMotion:true});try{assert(reduced.document.body.classList.contains('no-companion-motion'));assert.equal(reduced.get('motionToggle').getAttribute('aria-pressed'),'false');assert.match(reduced.get('motionToggle').textContent,/关闭/);assert.equal(reduced.calls.length,0);}finally{reduced.dispose();}
+  const s=setup();try{
+   const stage=s.get('companionStage');stage.getBoundingClientRect=()=>({left:0,top:0,width:200,height:140});
+   stage.dispatchEvent({type:'pointermove',clientX:200,clientY:140});assert.equal(stage.style['--look-x'],'3px');assert.equal(stage.style['--look-y'],'2px');
+   s.get('motionToggle').click();assert(s.document.body.classList.contains('no-companion-motion'));assert.equal(stage.style['--look-x'],'0px');assert.equal(stage.style['--look-y'],'0px');
+   stage.dispatchEvent({type:'pointermove',clientX:200,clientY:140});assert.equal(stage.style['--look-x'],'0px');assert.equal(stage.style['--look-y'],'0px');
+   s.get('motionToggle').click();assert(!s.document.body.classList.contains('no-companion-motion'));assert.equal(s.get('motionToggle').getAttribute('aria-pressed'),'true');assert.equal(s.calls.length,0);assert.equal(s.eval('teamEvents.length'),0);
+  }finally{s.dispose();}
+ });
  await caseTest('local demo completes without API keys or fetch calls',async()=>{
   const s=setup();try{
    for(const id of Object.keys(KEYS))s.get(id+'Key').value='';
    await s.eval('start({preventDefault(){}},true)');assert.equal(s.calls.length,0);assert.equal(s.get('demoNotice').hidden,false);assert.match(s.get('reportState').textContent,/预置内容/);assert.match(s.get('report').textContent,/自由职业者/);assert.equal(s.get('recordCount').textContent,'3');assert.equal(s.eval('sessionHistory[0].demo'),true);assert.equal(s.get('copy').disabled,false);
+   const events=JSON.parse(s.eval('JSON.stringify(teamEvents)'));assert(events.length>3);assert(events.every(e=>e.time==='演示'));for(const id of ['gemini','grok','gpt'])assert.equal(s.get(id+'Persona').dataset.state,'done');
    s.eval('resetWorkspace()');assert.equal(s.get('demoNotice').hidden,true);s.get('history').querySelector('button').click();assert.equal(s.get('demoNotice').hidden,false);assert.match(s.get('reportState').textContent,/预置内容/);
   }finally{s.dispose();}
  });
